@@ -3,9 +3,12 @@ package goapollo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -30,7 +33,7 @@ type namespaceItem struct {
 func NewNamespaceItem(ctx context.Context, serverUrl, namespace string, config ApolloConfig) (*namespaceItem, error) {
 	c := &namespaceItem{
 		serverUrl:        serverUrl,
-		namespace:        namespace,
+		namespace:        strings.TrimSpace(namespace),
 		cacheRequester:   newHTTPRequester(&http.Client{Timeout: time.Second * 30}),
 		dataRequester:    newHTTPRequester(&http.Client{Timeout: time.Second * 30}),
 		requester:        newHTTPRequester(&http.Client{}),
@@ -41,7 +44,7 @@ func NewNamespaceItem(ctx context.Context, serverUrl, namespace string, config A
 	}
 	c.notifications.Store(namespace, defaultNotificationId)
 	if err := c.preload(); err != nil {
-		log.Println(err)
+		log.Printf("[%s] 预加载失败 -> %s", c.namespace, err)
 		return nil, err
 	}
 	c.ctx, c.cancel = context.WithCancel(ctx)
@@ -52,7 +55,7 @@ func NewNamespaceItem(ctx context.Context, serverUrl, namespace string, config A
 // preload 预加载配置信息,先尝试从远程服务器拉取，如果失败，则尝试从备份文件中读取，如果再失败则返回错误.
 func (c *namespaceItem) preload() error {
 	if _, err := c.fetchFromDatabase(); err != nil {
-
+		log.Printf("[%s] 从数据库拉取配置失败 -> %s", c.namespace, err)
 		if b, err := ioutil.ReadFile(c.backFile); err == nil && len(b) > 0 {
 			if err := c.configurations.Decode(b); err == nil {
 				return nil
@@ -116,21 +119,26 @@ func (c *namespaceItem) Watch(ch chan *ChangeEvent) {
 					} else {
 
 						event := NewChangeEvent(c.namespace)
-						//先遍历修改或删除的键值
-						c.configurations.Range(func(k, v string) bool {
-							vv, _ := kv[k]
-							event.Store(k, v, vv)
-							return true
-						})
+						if c.GetConfigType() == C_TYPE_POROPERTIES {
+							//先遍历修改或删除的键值
+							c.configurations.Range(func(k, v string) bool {
+								vv, _ := kv[k]
+								event.Store(k, v, vv)
+								return true
+							})
 
-						for k, v := range kv {
-							// 再处理新增的键值
-							if vv, ok := c.configurations.Load(k); !ok {
-								event.Store(k, vv, v)
+							for k, v := range kv {
+								// 再处理新增的键值
+								if vv, ok := c.configurations.Load(k); !ok {
+									event.Store(k, vv, v)
+								}
+								c.configurations.Store(k, v)
 							}
-							c.configurations.Store(k, v)
+						} else if _, ok := kv["content"]; ok {
+							oldValue, _ := c.configurations.Load("content")
+							event.Store("content", oldValue, kv["content"])
+							c.configurations.Store("content", kv["content"])
 						}
-
 						ch <- event
 						log.Printf("[%s] 配置变更已处理 -> %+v", c.namespace, c.configurations)
 					}
@@ -143,6 +151,7 @@ func (c *namespaceItem) Watch(ch chan *ChangeEvent) {
 	})
 }
 
+// FetchAllTask 全量拉取配置
 func (c *namespaceItem) FetchAllTask(t time.Duration) {
 	go func() {
 		timer := time.NewTimer(t)
@@ -169,6 +178,11 @@ func (c *namespaceItem) FetchAllTask(t time.Duration) {
 			}
 		}
 	}()
+}
+
+// Namespace 获取命名空间名称
+func (c *namespaceItem) Namespace() string {
+	return c.namespace
 }
 
 func (c *namespaceItem) request() (*ApolloNotificationMessages, error) {
@@ -202,13 +216,18 @@ func (c *namespaceItem) fetchFromDatabase() (*ApolloResult, error) {
 
 	serverUrl := getApolloRemoteConfigFromDbUrl(c.serverUrl, c.config.AppId, c.config.Cluster, c.namespace, c.releaseKey)
 
+	log.Printf("[%s] 从远程配置系统拉取配置信息 ->%s", c.namespace, serverUrl)
 	body, err := c.dataRequester.request(serverUrl)
 
 	if err != nil {
+		log.Fatalf("%+v", err)
 		if err == ErrConfigUnmodified {
 			return nil, ErrConfigUnmodified
 		}
 		return nil, err
+	}
+	if len(body) <= 0 {
+		return nil, errors.New("没有配置信息")
 	}
 
 	config := ApolloResult{}
@@ -242,4 +261,24 @@ func (c *namespaceItem) fetchFromCache() (map[string]string, error) {
 	//log.Printf("[%s] 从缓存中拉取配置 %s - %+v\n", c.namespace, serverUrl, kv)
 
 	return kv, nil
+}
+
+// GetValue 获取配置
+func (c *namespaceItem) GetValue(key string) (string, bool) {
+	return c.configurations.Load(key)
+}
+
+// GetConfigType 获取配置类型
+func (c *namespaceItem) GetConfigType() ConfigType {
+	switch filepath.Ext(c.namespace) {
+	case ".json":
+		return C_TYPE_JSON
+	case ".xml":
+		return C_TYPE_XML
+	case ".yaml":
+		return C_TYPE_YAML
+	case ".yml":
+		return C_TYPE_YML
+	}
+	return C_TYPE_POROPERTIES
 }
