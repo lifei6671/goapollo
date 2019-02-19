@@ -31,6 +31,19 @@ func (m *ApolloNotificationMessages) String() string {
 	return string(b)
 }
 
+func (m *ApolloNotificationMessages) Notifications() []*ApolloConfigNotification {
+	details := make([]*ApolloConfigNotification, 0)
+	m.Range(func(key string, value int64) bool {
+		notify := &ApolloConfigNotification{
+			NamespaceName:  key,
+			NotificationId: value,
+		}
+		details = append(details, notify)
+		return true
+	})
+	return details
+}
+
 func (m *ApolloNotificationMessages) Put(key string, value int64) {
 	m.Store(key, value)
 }

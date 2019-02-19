@@ -26,8 +26,8 @@ type namespaceItem struct {
 	configurations   *Configurations
 	notifications    *ApolloNotificationMessages
 	notificationChan chan *ApolloNotificationMessages
-	once             sync.Once
 	backFile         string
+	once             sync.Once
 }
 
 func NewNamespaceItem(ctx context.Context, serverUrl, namespace string, config ApolloConfig) (*namespaceItem, error) {
@@ -43,8 +43,7 @@ func NewNamespaceItem(ctx context.Context, serverUrl, namespace string, config A
 		notificationChan: make(chan *ApolloNotificationMessages, 1),
 	}
 	c.notifications.Store(namespace, defaultNotificationId)
-	if err := c.preload(); err != nil {
-		log.Printf("[%s] 预加载失败 -> %s", c.namespace, err)
+	if err := c.preload(nil); err != nil {
 		return nil, err
 	}
 	c.ctx, c.cancel = context.WithCancel(ctx)
@@ -52,15 +51,53 @@ func NewNamespaceItem(ctx context.Context, serverUrl, namespace string, config A
 	return c, nil
 }
 
-// preload 预加载配置信息,先尝试从远程服务器拉取，如果失败，则尝试从备份文件中读取，如果再失败则返回错误.
-func (c *namespaceItem) preload() error {
+// NewNamespaceWithFile 从文件中创建对象
+func NewNamespaceWithFile(ctx context.Context, filename string) (*namespaceItem, error) {
+	var config Serialization
+
+	if b, err := ioutil.ReadFile(filename); err != nil {
+		return nil, err
+	} else if err := json.Unmarshal(b, &config); err != nil {
+		return nil, err
+	}
+	c, err := NewNamespaceWithSerialization(ctx, &config)
+
+	return c, err
+}
+
+func NewNamespaceWithSerialization(ctx context.Context, config *Serialization) (*namespaceItem, error) {
+	c := &namespaceItem{
+		serverUrl:        config.ServerUrl,
+		namespace:        config.Namespace,
+		cacheRequester:   newHTTPRequester(&http.Client{Timeout: time.Second * 30}),
+		dataRequester:    newHTTPRequester(&http.Client{Timeout: time.Second * 30}),
+		requester:        newHTTPRequester(&http.Client{}),
+		config:           ApolloConfig{AppId: config.AppId, Cluster: config.Cluster},
+		configurations:   NewConfiguration(),
+		notifications:    NewApolloNotificationMessages(),
+		notificationChan: make(chan *ApolloNotificationMessages, 1),
+	}
+	c.notifications.Store(config.Namespace, defaultNotificationId)
+
+	if err := c.preload(config.Configurations); err != nil {
+		return nil, err
+	}
+	c.ctx, c.cancel = context.WithCancel(ctx)
+
+	return c, nil
+}
+
+// preload 预加载配置信息,如果传递了.
+func (c *namespaceItem) preload(b []byte) error {
+	if len(b) > 0 {
+		if err := c.configurations.Decode(b); err == nil {
+			return nil
+		}
+	}
+
 	if _, err := c.fetchFromDatabase(); err != nil {
 		log.Printf("[%s] 从数据库拉取配置失败 -> %s", c.namespace, err)
-		if b, err := ioutil.ReadFile(c.backFile); err == nil && len(b) > 0 {
-			if err := c.configurations.Decode(b); err == nil {
-				return nil
-			}
-		}
+
 		return err
 	}
 	return nil
@@ -102,7 +139,7 @@ func (c *namespaceItem) Watch(ch chan *ChangeEvent) {
 						}
 					}
 				case <-c.ctx.Done():
-					log.Println("监听已停止 ->", c.namespace, c.serverUrl)
+					log.Printf("[%s] 监听已停止 -> %s", c.namespace, c.serverUrl)
 					return
 				}
 				timer.Reset(time.Second * 1)
@@ -143,7 +180,7 @@ func (c *namespaceItem) Watch(ch chan *ChangeEvent) {
 						log.Printf("[%s] 配置变更已处理 -> %+v", c.namespace, c.configurations)
 					}
 				case <-c.ctx.Done():
-					log.Printf("[%s] 通知处理已退出", c.namespace)
+					log.Printf("[%s] 通知监听已退出", c.namespace)
 					return
 				}
 			}
@@ -281,4 +318,17 @@ func (c *namespaceItem) GetConfigType() ConfigType {
 		return C_TYPE_YML
 	}
 	return C_TYPE_POROPERTIES
+}
+
+func (c *namespaceItem) Dump() (s *Serialization, err error) {
+	s = &Serialization{}
+	s.Configurations, err = c.configurations.Encode()
+	s.Namespace = c.namespace
+	s.Cluster = c.config.Cluster
+	s.AppId = c.config.AppId
+	s.ServerUrl = c.serverUrl
+	s.ReleaseKey = c.releaseKey
+	s.Notification = c.notifications.Notifications()
+	return
+
 }
