@@ -102,9 +102,7 @@ func (n *notificationRepo) Watch() <-chan *Notification {
 						resp, err := n.client.Do(req)
 
 						if err != nil {
-							if err != ErrConfigUnmodified {
-								logger.Printf("发起通知请求失败 -> %s - %s", notificationUrl, err)
-							}
+							logger.Printf("发起通知请求失败 -> %s - %s", notificationUrl, err)
 							break
 						}
 						if resp.StatusCode == http.StatusNotModified {
