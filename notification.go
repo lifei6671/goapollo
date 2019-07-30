@@ -33,12 +33,12 @@ type INotification interface {
 	io.Closer
 	AddNamespace(namespace string)
 	DeleteNamespace(namespace string)
-	Watch(ctx context.Context) <-chan Notification
+	Watch() <-chan *Notification
 }
 
 type notificationRepo struct {
 	notifications   *sync.Map
-	notificationCh  chan Notification
+	notificationCh  chan *Notification
 	client          *http.Client
 	notificationUrl string
 	cancel          context.CancelFunc
@@ -63,10 +63,10 @@ func newNotificationRepo(host, appId, cluster string) *notificationRepo {
 		notifications:   &sync.Map{},
 		notificationUrl: notificationUrl,
 		client: &http.Client{
-			Timeout:   time.Second * 30,
+			Timeout:   time.Second * 90,
 			Transport: netTransport,
 		},
-		notificationCh: make(chan Notification, 10),
+		notificationCh: make(chan *Notification, 10),
 		once:           &sync.Once{},
 	}
 }
@@ -79,55 +79,67 @@ func (n *notificationRepo) DeleteNamespace(namespace string) {
 	n.notifications.Delete(namespace)
 }
 
-func (n *notificationRepo) Watch(ctx context.Context) <-chan Notification {
+func (n *notificationRepo) Watch() <-chan *Notification {
 	n.once.Do(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		n.cancel = cancel
 		go func() {
-			ctx1, cancel := context.WithCancel(ctx)
-			n.cancel = cancel
 			for {
-				notificationUrl := n.notificationUrl + url.QueryEscape(n.String())
-				req, err := http.NewRequest("GET", notificationUrl, nil)
-				if err != nil {
-					logger.Errorf("构建 Request 出错 -> %s", err)
-					continue
-				}
-				req = req.WithContext(ctx1)
-
-				resp, err := n.client.Do(req)
-
-				if err != nil {
-					if err != ErrConfigUnmodified {
-						logger.Errorf("发起通知请求失败 -> %s - %s", notificationUrl, err)
-					}
-					continue
-				}
-				body, err := ioutil.ReadAll(resp.Body)
-
-				_ = resp.Body.Close()
-
-				if err != nil {
-					logger.Errorf("读取通知响应失败 -> %s - %s", notificationUrl, err)
-					continue
-				}
-
-				var notifications []Notification
-				err = json.Unmarshal(body, &notifications)
-				if err != nil {
-					logger.Errorf("解析通知响应失败 -> %s - %s", notificationUrl, err)
-					continue
-				}
-				for i, item := range notifications {
-					//这里预防将删除后的通知再次存入到缓存中
-					if _, ok := n.notifications.Load(item.NamespaceName); ok {
-						n.notifications.Store(item.NamespaceName, item.NotificationId)
-						n.notificationCh <- notifications[i]
-					}
-				}
-
 				select {
-				case <-ctx1.Done():
+				case <-ctx.Done():
 					return
 				default:
+					{
+						notificationUrl := n.notificationUrl + url.QueryEscape(n.String())
+						logger.Printf("正在发起通知 -> %s\n", notificationUrl)
+						req, err := http.NewRequest("GET", notificationUrl, nil)
+						if err != nil {
+							logger.Printf("构建 Request 出错 -> %s", err)
+							break
+						}
+						req = req.WithContext(ctx)
+
+						resp, err := n.client.Do(req)
+
+						if err != nil {
+							if err != ErrConfigUnmodified {
+								logger.Printf("发起通知请求失败 -> %s - %s", notificationUrl, err)
+							}
+							break
+						}
+						if resp.StatusCode == http.StatusNotModified {
+							logger.Printf("服务器端配置未改变 -> %d", resp.StatusCode)
+							_ = resp.Body.Close()
+							break
+						}
+
+						body, err := ioutil.ReadAll(resp.Body)
+
+						_ = resp.Body.Close()
+
+						if err != nil {
+							logger.Printf("读取通知响应失败 -> %s - %s", notificationUrl, err)
+							break
+						}
+						if resp.StatusCode != http.StatusOK {
+							logger.Printf("服务器响应失败 -> %d - %s", resp.StatusCode, string(body))
+							break
+						}
+						logger.Printf("正在解析通知 -> %s - %s", notificationUrl, string(body))
+						var notifications []*Notification
+						err = json.Unmarshal(body, &notifications)
+						if err != nil {
+							logger.Printf("解析通知响应失败 -> %s - %s - %s", notificationUrl, string(body), err)
+							break
+						}
+						for i, item := range notifications {
+							//这里预防将删除后的通知再次存入到缓存中
+							if _, ok := n.notifications.Load(item.NamespaceName); ok {
+								n.notifications.Store(item.NamespaceName, item.NotificationId)
+								n.notificationCh <- notifications[i]
+							}
+						}
+					}
 				}
 			}
 		}()
