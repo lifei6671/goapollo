@@ -83,7 +83,7 @@ func (c *Client) SetClientIp(ip string) {
 }
 
 func (c *Client) preload(namespace string) {
-	err := c.caches.load(filepath.Join(c.cacheDir, c.appId, namespace))
+	err := c.caches.load(namespace, filepath.Join(c.cacheDir, c.appId, namespace))
 	if err != nil {
 		logger.Printf("解析备份文件失败 -> %s", err)
 	}
@@ -133,11 +133,26 @@ func (c *Client) sync(namespace string) (*ChangeEvent, error) {
 	return c.caches.store(result), nil
 }
 
+//AddNamespace 使用默认序列化器添加命名空间
 func (c *Client) AddNamespace(name string) *Client {
-	c.rmx.Lock()
-	defer c.rmx.Unlock()
-	c.notification.AddNamespace(name)
-	c.preload(name)
+	c.AddNamespaceWithSerializer(name, NewJsonSerializer())
+	return c
+}
+
+//AddNamespaceAndSerializer 使用自定义序列化器添加命名空间
+func (c *Client) AddNamespaceWithSerializer(namespace string, serializer Serializer) *Client {
+	path := filepath.Join(c.cacheDir, c.appId, namespace)
+	c.AddNamespaceWithSerializerWithPath(namespace, serializer, path)
+	return c
+}
+
+func (c *Client) AddNamespaceWithSerializerWithPath(namespace string, serializer Serializer, filename string) *Client {
+	c.notification.AddNamespace(namespace)
+	c.caches.addSerializer(namespace, serializer)
+	err := c.caches.load(namespace, filename)
+	if err != nil {
+		logger.Printf("解析备份文件失败 -> %s", err)
+	}
 	return c
 }
 
@@ -158,6 +173,7 @@ func (c *Client) Run(ctx context.Context) error {
 		for {
 			select {
 			case notify := <-c.notification.Watch():
+
 				if event, err := c.sync(notify.NamespaceName); err != nil {
 					logger.Printf("同步最新配置失败 -> %s - %s - %s - %s", c.appId, c.cluster, notify.NamespaceName, err)
 					break
@@ -167,8 +183,7 @@ func (c *Client) Run(ctx context.Context) error {
 					case c.eventCh <- event:
 					default:
 					}
-
-					_ = c.caches.dump(notify.NamespaceName, filepath.Join(c.cacheDir, c.appId))
+					_ = c.caches.dump(notify.NamespaceName)
 				}
 
 			case <-ctx1.Done():
@@ -182,6 +197,8 @@ func (c *Client) Run(ctx context.Context) error {
 func (c *Client) Close() error {
 	c.rmx.Lock()
 	defer c.rmx.Unlock()
+	_ = c.caches.save()
+
 	if c.cancel != nil {
 		c.cancel()
 	}
@@ -193,7 +210,6 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) WatchUpdate() <-chan *ChangeEvent {
-
 	return c.eventCh
 }
 

@@ -8,6 +8,7 @@ import (
 type Configuration struct {
 	NamespaceName  string            `json:"namespace_name"`
 	Configurations map[string]string `json:"configurations"`
+	ReleaseKey     string            `json:"release_key"`
 }
 
 func (c *Configuration) String() string {
